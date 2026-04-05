@@ -901,6 +901,52 @@ async def help(ctx):
     await ctx.send(embed=e)
 
 # ══════════════════════════════════════════════════════
+#  VOL D'EMOJI
+# ══════════════════════════════════════════════════════
+@bot.command(name="emojis")
+@commands.has_permissions(manage_emojis=True)
+async def steal_emoji(ctx, emoji: str = None):
+    if emoji is None:
+        await ctx.send("❌ Utilisation : `!emojis <emoji>`")
+        return
+
+    match = re.match(r"<(a?):(\w+):(\d+)>", emoji)
+    if not match:
+        await ctx.send("❌ Ce n'est pas un emoji personnalisé d'un autre serveur. Envoie un emoji comme ça : `!emojis <:nom:id>`")
+        return
+
+    animated = match.group(1) == "a"
+    name = match.group(2)
+    emoji_id = match.group(3)
+    ext = "gif" if animated else "png"
+    url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                await ctx.send("❌ Impossible de télécharger cet emoji.")
+                return
+            image_data = await resp.read()
+
+    try:
+        new_emoji = await ctx.guild.create_custom_emoji(name=name, image=image_data)
+        e = discord.Embed(
+            title="✅ Emoji volé !",
+            description=f"{new_emoji} `:{new_emoji.name}:` a été ajouté au serveur !",
+            color=0x00ff99
+        )
+        await ctx.send(embed=e)
+    except discord.Forbidden:
+        await ctx.send("❌ Je n'ai pas la permission d'ajouter des emojis.")
+    except discord.HTTPException as err:
+        await ctx.send(f"❌ Erreur : {err}")
+
+@steal_emoji.error
+async def steal_emoji_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ Tu n'as pas la permission de gérer les emojis.")
+
+# ══════════════════════════════════════════════════════
 #  SERVEUR WEB (maintien en ligne via UptimeRobot)
 # ══════════════════════════════════════════════════════
 async def health(request):
