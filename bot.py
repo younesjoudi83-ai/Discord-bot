@@ -331,14 +331,16 @@ async def on_message(message: discord.Message):
             pass
         return
 
-    # Réponses automatiques
-    for trigger, response in auto_responses.get(gid, {}).items():
-        if trigger in content:
-            try:
-                await message.channel.send(response)
-            except discord.Forbidden:
-                pass
-            break
+    # Réponses automatiques (ignorées si le message est une commande)
+    is_command = message.content.startswith(bot.command_prefix)
+    if not is_command:
+        for trigger, response in auto_responses.get(gid, {}).items():
+            if trigger in content:
+                try:
+                    await message.channel.send(response)
+                except discord.Forbidden:
+                    pass
+                break
 
     await bot.process_commands(message)
 
@@ -355,9 +357,17 @@ async def on_command_error(ctx, error):
             "Vérifie la syntaxe avec `!help`."), delete_after=6)
     elif isinstance(error, commands.CommandOnCooldown):
         remaining = int(error.retry_after)
-        await ctx.send(embed=em_err("Cooldown",
-            f"Attends encore `{remaining}s` avant de réutiliser cette commande."),
-            delete_after=5)
+        # Message spécial pour !daily (affiche heures et minutes)
+        if ctx.command and ctx.command.name == "daily":
+            h = remaining // 3600
+            m = (remaining % 3600) // 60
+            e = em_err("Déjà réclamé", f"Reviens dans **{h}h {m}min** pour ta prochaine récompense.")
+            _foot(e, ctx.author)
+            await ctx.send(embed=e, delete_after=8)
+        else:
+            await ctx.send(embed=em_err("Cooldown",
+                f"Attends encore `{remaining}s` avant de réutiliser cette commande."),
+                delete_after=5)
     else:
         logger.error(f"Erreur {ctx.command} : {error}")
 
@@ -686,14 +696,6 @@ async def daily(ctx):
     e = em_gold("Récompense quotidienne",
         f"Tu as reçu **{DAILY_AMOUNT:,}** pièces !\n```\n✦  Solde : {get_bal(uid):,} pièces\n```")
     _foot(e, ctx.author); await ctx.send(embed=e)
-
-@daily.error
-async def daily_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        h = int(error.retry_after) // 3600
-        m = (int(error.retry_after) % 3600) // 60
-        e = em_err("Déjà réclamé", f"Reviens dans **{h}h {m}min**.")
-        _foot(e, ctx.author); await ctx.send(embed=e, delete_after=8)
 
 
 @bot.command(aliases=["give"])
