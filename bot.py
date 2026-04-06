@@ -453,6 +453,16 @@ async def help(ctx, category: str = None):
                 ("",                                "Unités : s, m, h, j"),
             ]
         },
+        "embeds": {
+            "title": "🎨  Embeds", "color": C_GOLD,
+            "cmds": [
+                ("!embed <couleur> <titre> | <desc>",   "Embed simple"),
+                ("",                                     "Couleurs : violet, gold, rouge, vert, bleu, dark, jaune"),
+                ("!panel <titre>",                       "Embed multi-sections (style équipe)"),
+                ("",                                     "Sépare les sections avec ---"),
+                ("!embedraw #salon <couleur> <titre> | <desc>", "Envoie dans un autre salon"),
+            ]
+        },
     }
 
     if category and category.lower() in cats:
@@ -476,6 +486,7 @@ async def help(ctx, category: str = None):
     e.add_field(name="◇  Fun",         value="`!help fun`",    inline=True)
     e.add_field(name="⚙  Config",      value="`!help config`", inline=True)
     e.add_field(name="◈  Rappels",     value="`!help remind`", inline=True)
+    e.add_field(name="🎨  Embeds",     value="`!help embeds`", inline=True)
     e.add_field(name="🔗  Préfixe",    value="`!`",            inline=True)
     e.set_footer(text=BOT_SIGNATURE,
                  icon_url=ctx.guild.icon.url if ctx.guild and ctx.guild.icon else None)
@@ -1083,6 +1094,152 @@ async def reminder(ctx, duration: str, *, message: str):
     e.add_field(name="◈ Message", value=f"```{message}```", inline=False)
     e.add_field(name="◈ Dans",    value=f"`{duration}`",    inline=True)
     _foot(e, ctx.author); await ctx.send(embed=e)
+
+# ══════════════════════════════════════════════════════
+#  EMBEDS PERSONNALISÉS
+# ══════════════════════════════════════════════════════
+
+# Couleurs disponibles pour !embed
+EMBED_COLORS = {
+    "violet": C_VIOLET,
+    "gold":   C_GOLD,
+    "rouge":  C_RED,
+    "vert":   C_GREEN,
+    "bleu":   C_BLUE,
+    "dark":   C_DARK,
+    "jaune":  C_YELLOW,
+}
+
+
+@bot.command(name="embed")
+@commands.guild_only()
+async def custom_embed(ctx, couleur: str = "violet", *, contenu: str):
+    """
+    Envoie un embed stylé dans le salon.
+    Utilisation : !embed <couleur> <titre> | <description>
+
+    Couleurs : violet, gold, rouge, vert, bleu, dark, jaune
+    Exemple   : !embed gold Équipe officielle | Voici notre équipe...
+
+    Tu peux aussi utiliser des sauts de ligne avec \\n
+    """
+    if not is_mod(ctx.author):
+        return await no_perm(ctx)
+
+    # Supprimer le message de commande
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        pass
+
+    color = EMBED_COLORS.get(couleur.lower(), C_VIOLET)
+
+    # Séparer titre et description avec " | "
+    if " | " in contenu:
+        titre, desc = contenu.split(" | ", 1)
+    else:
+        titre = contenu
+        desc  = None
+
+    # Remplacer \n par de vrais sauts de ligne
+    if desc:
+        desc = desc.replace("\\n", "\n")
+
+    e = discord.Embed(title=titre.strip(), description=desc, color=color)
+    e.set_footer(text=BOT_SIGNATURE)
+    await ctx.send(embed=e)
+
+
+@bot.command(name="panel")
+@commands.guild_only()
+async def panel_embed(ctx, *, contenu: str):
+    """
+    Crée un embed multi-sections style panel d'équipe.
+    Sépare les sections avec --- sur une nouvelle ligne.
+
+    Utilisation :
+    !panel Titre principal
+    ---
+    🔑 Section 1 : sous-titre
+    Description de la section
+    • Point 1
+    • Point 2
+    ---
+    🛡️ Section 2 : sous-titre
+    Description
+    • Point 1
+    """
+    if not is_mod(ctx.author):
+        return await no_perm(ctx)
+
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        pass
+
+    lignes = contenu.split("\n")
+    titre_principal = lignes[0].strip() if lignes else "Panel"
+
+    # Reconstruire le texte sans la première ligne
+    reste = "\n".join(lignes[1:]).strip()
+
+    # Séparer les sections par ---
+    sections = [s.strip() for s in reste.split("---") if s.strip()]
+
+    e = discord.Embed(title=titre_principal, color=C_VIOLET)
+
+    if sections:
+        for section in sections:
+            lignes_sec = section.split("\n")
+            # La première ligne de la section = nom du champ
+            nom_champ = lignes_sec[0].strip() if lignes_sec else "◈"
+            valeur    = "\n".join(lignes_sec[1:]).strip() if len(lignes_sec) > 1 else "\u200b"
+            e.add_field(name=nom_champ, value=valeur, inline=False)
+    else:
+        e.description = reste
+
+    e.set_footer(text=BOT_SIGNATURE)
+    await ctx.send(embed=e)
+
+
+@bot.command(name="embedraw")
+@commands.guild_only()
+async def embed_raw(ctx, salon: discord.TextChannel = None, couleur: str = "violet", *, contenu: str):
+    """
+    Envoie un embed dans un salon spécifique.
+    Utilisation : !embedraw #salon <couleur> <titre> | <description>
+    """
+    if not is_mod(ctx.author):
+        return await no_perm(ctx)
+
+    try:
+        await ctx.message.delete()
+    except discord.Forbidden:
+        pass
+
+    destination = salon or ctx.channel
+    color = EMBED_COLORS.get(couleur.lower(), C_VIOLET)
+
+    if " | " in contenu:
+        titre, desc = contenu.split(" | ", 1)
+    else:
+        titre = contenu
+        desc  = None
+
+    if desc:
+        desc = desc.replace("\\n", "\n")
+
+    e = discord.Embed(title=titre.strip(), description=desc, color=color)
+    e.set_footer(text=BOT_SIGNATURE)
+
+    try:
+        await destination.send(embed=e)
+        confirm = em_ok("Embed envoyé", f"Embed envoyé dans {destination.mention}")
+        await ctx.send(embed=confirm, delete_after=4)
+    except discord.Forbidden:
+        await ctx.send(embed=em_err("Permission refusée",
+            f"Je ne peux pas écrire dans {destination.mention}"))
+
 
 # ══════════════════════════════════════════════════════
 #  DÉMARRAGE
