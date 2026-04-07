@@ -1711,7 +1711,7 @@ async def niveau(ctx, membre: discord.Member = None):
     await ctx.send(embed=e)
 
 
-@bot.command(aliases=["topxp", "classementxp"])
+@bot.command(aliases=["classementxp", "rankingxp"])
 @commands.guild_only()
 async def topxp(ctx):
     uid_list = ctx.guild.members
