@@ -6,6 +6,7 @@ import json
 import asyncio
 import re
 import logging
+import math
 from datetime import datetime, timedelta
 
 # ══════════════════════════════════════════════════════
@@ -51,6 +52,42 @@ C_BLUE   = 0x2C3E7A
 C_DARK   = 0x0D0D1A
 
 DEFAULT_SHOP = {"VIP": 500, "Casino Pro": 1000, "Rôle Chanceux": 300}
+
+# XP & Niveaux
+XP_MIN          = 5
+XP_MAX          = 15
+XP_COOLDOWN_SEC = 60
+
+LEVEL_ROLES = {
+    # Modifie ces noms de rôles selon ton serveur
+    5:  "Niveau 5",
+    10: "Niveau 10",
+    20: "Niveau 20",
+    50: "Niveau 50",
+}
+
+# Succès / achievements
+ACHIEVEMENTS = {
+    "first_msg":   ("Premier pas",      "◈", "Envoyer ton premier message"),
+    "level_5":     ("En route",         "⭐", "Atteindre le niveau 5"),
+    "level_10":    ("Habitué",          "🌟", "Atteindre le niveau 10"),
+    "level_25":    ("Vétéran",          "💫", "Atteindre le niveau 25"),
+    "level_50":    ("Légende",          "👑", "Atteindre le niveau 50"),
+    "rich_1k":     ("Petit fortune",    "💰", "Avoir 1 000 pièces"),
+    "rich_10k":    ("Grande fortune",   "💎", "Avoir 10 000 pièces"),
+    "gambler":     ("Joueur",           "🎰", "Utiliser !gamble"),
+    "thief_ok":    ("Voleur",           "🦹", "Réussir un vol"),
+    "thief_fail":  ("Maladroit",        "😅", "Échouer un vol"),
+    "collector":   ("Collectionneur",   "📚", "Avoir 10 cartes"),
+    "warned":      ("Mauvais élève",    "⚠️", "Recevoir 3 avertissements"),
+    "daily_7":     ("Régulier",         "📅", "Faire !daily 7 jours"),
+}
+
+# Footers variés par catégorie
+FOOTERS_MOD  = ["⚔ Modération", "⚔ Action modérateur", "⚔ Log de modération"]
+FOOTERS_ECO  = ["✦ Économie", "✦ Système monétaire", "✦ Transaction"]
+FOOTERS_FUN  = ["◇ Fun", "◇ Divertissement", "◇ Jeux"]
+FOOTERS_LVL  = ["◈ Niveaux", "◈ Progression", "◈ Rang"]
 
 CHARACTERS = [
     ("Naruto", "⭐⭐⭐", "🦊"),    ("Goku", "⭐⭐⭐⭐⭐", "🐉"),
@@ -123,11 +160,17 @@ auto_responses= _load("auto_responses",{})
 word_filter   = _load("word_filter",   {})
 link_filter   = _load("link_filter",   {})
 
+# ── Nouvelles données persistées ────────────────────
+xp_data        = _load("xp",           {})
+achievements_d = _load("achievements",  {})
+daily_streak   = _load("daily_streak",  {})
+
 # ── Données en mémoire uniquement ───────────────────
 spam_tracker: dict  = {}
 snipe_cache:  dict  = {}
 reminders:    list  = []
 cooldowns:    dict  = {}
+xp_cooldowns: dict  = {}   # anti-spam XP
 
 # ══════════════════════════════════════════════════════
 #  BOT
@@ -194,6 +237,50 @@ async def no_perm(ctx):
     await ctx.send(embed=_foot(em_err("Accès refusé",
         "```\nVous ne disposez pas des permissions nécessaires.\n```"), ctx.author),
         delete_after=6)
+
+# ══════════════════════════════════════════════════════
+#  HELPERS — XP / NIVEAUX / SUCCÈS
+# ══════════════════════════════════════════════════════
+def calc_level(xp: int) -> int:
+    return int(math.sqrt(xp / 100))
+
+def xp_for_level(lvl: int) -> int:
+    return lvl * lvl * 100
+
+def xp_for_next(lvl: int) -> int:
+    return xp_for_level(lvl + 1)
+
+def get_xp_info(uid: str) -> dict:
+    xp_data.setdefault(uid, {"xp": 0, "level": 0})
+    return xp_data[uid]
+
+def grant_achievement(uid: str, key: str) -> bool:
+    """Octroie un succès. Retourne True si c'est nouveau."""
+    achievements_d.setdefault(uid, [])
+    if key not in achievements_d[uid]:
+        achievements_d[uid].append(key)
+        save("achievements", achievements_d)
+        return True
+    return False
+
+def check_balance_achievements(uid: str):
+    bal = get_bal(uid)
+    if bal >= 1000:  grant_achievement(uid, "rich_1k")
+    if bal >= 10000: grant_achievement(uid, "rich_10k")
+
+def xp_bar(xp: int, level: int, bar_len: int = 12) -> str:
+    needed = xp_for_next(level)
+    current = xp_for_level(level)
+    prog = xp - current
+    total = needed - current
+    filled = int((prog / max(total, 1)) * bar_len)
+    return "█" * filled + "░" * (bar_len - filled)
+
+def em_lvl(t, d=None):
+    e = discord.Embed(title=f"◈ {t}", description=d, color=C_VIOLET,
+                      timestamp=datetime.utcnow())
+    e.set_footer(text=random.choice(FOOTERS_LVL) + f"  •  {BOT_SIGNATURE}")
+    return e
 
 # ══════════════════════════════════════════════════════
 #  ÉVÉNEMENTS
@@ -331,6 +418,55 @@ async def on_message(message: discord.Message):
             pass
         return
 
+    # ─── Gain XP (une fois par XP_COOLDOWN_SEC par utilisateur) ───
+    now_ts = now.timestamp()
+    if now_ts - xp_cooldowns.get(uid, 0) >= XP_COOLDOWN_SEC:
+        xp_cooldowns[uid] = now_ts
+        xp_gain    = random.randint(XP_MIN, XP_MAX)
+        info       = get_xp_info(uid)
+        old_level  = info["level"]
+        info["xp"] += xp_gain
+        new_level  = calc_level(info["xp"])
+        info["level"] = new_level
+        save("xp", xp_data)
+
+        # Premier message
+        if info["xp"] <= xp_gain:
+            grant_achievement(uid, "first_msg")
+
+        # Level-up
+        if new_level > old_level:
+            try:
+                e = discord.Embed(
+                    title="◈  Niveau supérieur !",
+                    description=(
+                        f"{message.author.mention} est passé au niveau **{new_level}** ! 🎉\n"
+                        f"> XP total : `{info['xp']:,}`"
+                    ),
+                    color=C_GOLD, timestamp=datetime.utcnow()
+                )
+                e.set_footer(text=random.choice(FOOTERS_LVL) + f"  •  {BOT_SIGNATURE}")
+                e.set_thumbnail(url=message.author.display_avatar.url)
+                await message.channel.send(embed=e)
+            except discord.Forbidden:
+                pass
+
+            # Rôle de niveau
+            role_name = LEVEL_ROLES.get(new_level)
+            if role_name:
+                role = discord.utils.get(message.guild.roles, name=role_name)
+                if role:
+                    try:
+                        await message.author.add_roles(role)
+                    except discord.Forbidden:
+                        pass
+
+            # Succès de niveau
+            if new_level >= 5:  grant_achievement(uid, "level_5")
+            if new_level >= 10: grant_achievement(uid, "level_10")
+            if new_level >= 25: grant_achievement(uid, "level_25")
+            if new_level >= 50: grant_achievement(uid, "level_50")
+
     # Réponses automatiques (ignorées si le message est une commande)
     is_command = message.content.startswith(bot.command_prefix)
     if not is_command:
@@ -395,112 +531,170 @@ async def before_reminder():
     await bot.wait_until_ready()
 
 # ══════════════════════════════════════════════════════
-#  AIDE
+#  AIDE — DONNÉES
 # ══════════════════════════════════════════════════════
-@bot.command(aliases=["aide", "commands"])
-async def help(ctx, category: str = None):
-    cats = {
-        "mod": {
-            "title": "⚔  Modération", "color": C_VIOLET,
-            "cmds": [
-                ("!kick <membre> [raison]",         "Expulse un membre"),
-                ("!ban <membre> [raison]",           "Bannit un membre"),
-                ("!unban <id>",                      "Débannit par ID"),
-                ("!mute <membre> [min] [raison]",    "Timeout temporaire"),
-                ("!unmute <membre>",                 "Retire le mute"),
-                ("!warn <membre> [raison]",          "Avertissement"),
-                ("!warns [membre]",                  "Voir les warns"),
-                ("!clear [nombre]",                  "Supprime des messages"),
-                ("!slowmode [secondes]",             "Slowmode"),
-                ("!lock / !unlock",                  "Verrouille/déverrouille"),
-            ]
-        },
-        "eco": {
-            "title": "✦  Économie", "color": C_GOLD,
-            "cmds": [
-                ("!balance [membre]",               "Voir son solde"),
-                ("!daily",                          "Récompense journalière"),
-                ("!don <membre> <montant>",         "Donner des pièces"),
-                ("!leaderboard",                    "Top 10"),
-                ("!shop",                           "Voir la boutique"),
-                ("!buy <article>",                  "Acheter un article"),
-                ("!gamble <montant>",               "Pari 50/50"),
-            ]
-        },
-        "fun": {
-            "title": "◇  Fun", "color": C_DARK,
-            "cmds": [
-                ("!roll",                           "Invoquer un perso (30s cd)"),
-                ("!inventory [membre]",             "Ta collection"),
-                ("!8ball <question>",               "Oracle mystique"),
-                ("!de [faces]",                     "Lancer un dé"),
-                ("!coinflip",                       "Pile ou face"),
-                ("!snipe",                          "Dernier message supprimé"),
-                ("!avatar [membre]",                "Voir un avatar"),
-                ("!serverinfo",                     "Infos serveur"),
-                ("!userinfo [membre]",              "Infos membre"),
-            ]
-        },
-        "config": {
-            "title": "⚙  Configuration", "color": C_VIOLET,
-            "cmds": [
-                ("!setautorole <rôle>",             "Rôle auto nouveaux membres"),
-                ("!addrr <msg_id> <emoji> <rôle>",  "Ajouter reaction role"),
-                ("!removerr <msg_id> <emoji>",       "Retirer reaction role"),
-                ("!addresponse <trigger> <rep>",     "Réponse automatique"),
-                ("!removeresponse <trigger>",         "Supprimer réponse auto"),
-                ("!addword <mot>",                   "Ajouter mot banni"),
-                ("!removeword <mot>",                "Retirer mot banni"),
-                ("!linkfilter <on/off>",             "Filtre de liens"),
-                ("!additem <prix> <nom>",            "Ajouter article boutique"),
-                ("!removeitem <nom>",                "Retirer article boutique"),
-            ]
-        },
-        "remind": {
-            "title": "◈  Rappels", "color": C_DARK,
-            "cmds": [
-                ("!reminder <durée> <message>",     "Créer un rappel"),
-                ("",                                "Unités : s, m, h, j"),
-            ]
-        },
-        "embeds": {
-            "title": "🎨  Embeds", "color": C_GOLD,
-            "cmds": [
-                ("!embed <couleur> <titre> | <desc>",   "Embed simple"),
-                ("",                                     "Couleurs : violet, gold, rouge, vert, bleu, dark, jaune"),
-                ("!panel <titre>",                       "Embed multi-sections (style équipe)"),
-                ("",                                     "Sépare les sections avec ---"),
-                ("!embedraw #salon <couleur> <titre> | <desc>", "Envoie dans un autre salon"),
-            ]
-        },
-    }
+HELP_CATS = {
+    "mod": {
+        "title": "⚔  Modération", "color": C_VIOLET, "emoji": "⚔",
+        "cmds": [
+            ("!kick <membre> [raison]",         "Expulse un membre"),
+            ("!ban <membre> [raison]",           "Bannit un membre"),
+            ("!unban <id>",                      "Débannit par ID"),
+            ("!mute <membre> [min] [raison]",    "Timeout temporaire"),
+            ("!unmute <membre>",                 "Retire le mute"),
+            ("!warn <membre> [raison]",          "Avertissement (cd 5 s)"),
+            ("!warns [membre]",                  "Voir les warns"),
+            ("!clear [nombre]",                  "Supprime des messages"),
+            ("!slowmode [secondes]",             "Slowmode"),
+            ("!lock / !unlock",                  "Verrouille/déverrouille"),
+        ]
+    },
+    "eco": {
+        "title": "✦  Économie", "color": C_GOLD, "emoji": "✦",
+        "cmds": [
+            ("!balance [membre]",               "Voir son solde"),
+            ("!daily",                          "Récompense journalière (cd 24h)"),
+            ("!don <membre> <montant>",         "Donner des pièces"),
+            ("!leaderboard",                    "Top 10 richesse"),
+            ("!shop",                           "Voir la boutique"),
+            ("!buy <article>",                  "Acheter un article"),
+            ("!gamble <montant>",               "Pari 50/50 (cd 10s)"),
+            ("!slots <montant>",                "Machine à sous (cd 15s)"),
+            ("!vol <membre>",                   "Tentative de vol (cd 1h, risqué)"),
+        ]
+    },
+    "fun": {
+        "title": "◇  Fun & Jeux", "color": C_DARK, "emoji": "◇",
+        "cmds": [
+            ("!roll",                           "Invoquer un perso (cd 30s)"),
+            ("!inventory [membre]",             "Ta collection de cartes"),
+            ("!blackjack <montant>",            "Jouer au blackjack (cd 15s)"),
+            ("!8ball <question>",               "Oracle mystique"),
+            ("!de [faces]",                     "Lancer un dé"),
+            ("!coinflip",                       "Pile ou face"),
+            ("!snipe",                          "Dernier message supprimé"),
+            ("!avatar [membre]",                "Voir un avatar"),
+            ("!serverinfo",                     "Infos serveur"),
+            ("!userinfo [membre]",              "Infos membre"),
+        ]
+    },
+    "niveau": {
+        "title": "◈  Niveaux & XP", "color": C_VIOLET, "emoji": "◈",
+        "cmds": [
+            ("!niveau [membre]",                "Voir son niveau et XP"),
+            ("!topxp",                          "Classement XP du serveur"),
+            ("!profil [membre]",                "Profil complet (niveau, éco, cartes)"),
+            ("!succes [membre]",                "Voir les succès débloqués"),
+            ("",                                "XP gagné : 5–15 par message (cd 60s)"),
+            ("",                                "Niveau = √(XP ÷ 100)"),
+        ]
+    },
+    "admin": {
+        "title": "🛡  Admin (mod only)", "color": C_RED, "emoji": "🛡",
+        "cmds": [
+            ("!addmoney <membre> <montant>",     "Ajouter des pièces à un membre"),
+            ("!removemoney <membre> <montant>",  "Retirer des pièces à un membre"),
+            ("!say <message>",                   "Faire parler le bot"),
+            ("!additem <prix> <nom>",            "Ajouter article boutique"),
+            ("!removeitem <nom>",                "Retirer article boutique"),
+        ]
+    },
+    "config": {
+        "title": "⚙  Configuration", "color": C_VIOLET, "emoji": "⚙",
+        "cmds": [
+            ("!setautorole <rôle>",             "Rôle auto nouveaux membres"),
+            ("!addrr <msg_id> <emoji> <rôle>",  "Ajouter reaction role"),
+            ("!removerr <msg_id> <emoji>",       "Retirer reaction role"),
+            ("!addresponse <trigger> <rep>",     "Réponse automatique"),
+            ("!removeresponse <trigger>",         "Supprimer réponse auto"),
+            ("!addword <mot>",                   "Ajouter mot banni"),
+            ("!removeword <mot>",                "Retirer mot banni"),
+            ("!linkfilter <on/off>",             "Filtre de liens"),
+        ]
+    },
+    "remind": {
+        "title": "◈  Rappels", "color": C_DARK, "emoji": "🔔",
+        "cmds": [
+            ("!reminder <durée> <message>",     "Créer un rappel"),
+            ("",                                "Unités : s, m, h, j"),
+            ("",                                "Ex : !reminder 30m Réunion"),
+        ]
+    },
+    "embeds": {
+        "title": "🎨  Embeds", "color": C_GOLD, "emoji": "🎨",
+        "cmds": [
+            ("!embed <couleur> <titre> | <desc>",        "Embed simple"),
+            ("",                                          "Couleurs : violet, gold, rouge, vert, bleu, dark, jaune"),
+            ("!panel <titre>",                            "Embed multi-sections"),
+            ("",                                          "Sépare les sections avec ---"),
+            ("!embedraw #salon <couleur> <titre> | <desc>","Envoie dans un autre salon"),
+        ]
+    },
+}
 
-    if category and category.lower() in cats:
-        data  = cats[category.lower()]
-        lines = [f"`{cmd}` — {desc}" if cmd else f"↳ {desc}"
-                 for cmd, desc in data["cmds"]]
-        e = discord.Embed(title=data["title"], color=data["color"],
-                          description="\n".join(lines),
-                          timestamp=datetime.utcnow())
-        e.set_footer(text=f"{BOT_SIGNATURE}  •  Préfixe : !")
-        return await ctx.send(embed=e)
+def _build_help_cat_embed(key: str) -> discord.Embed:
+    data  = HELP_CATS[key]
+    lines = [f"`{cmd}` — {desc}" if cmd else f"↳ *{desc}*"
+             for cmd, desc in data["cmds"]]
+    e = discord.Embed(title=data["title"], color=data["color"],
+                      description="\n".join(lines),
+                      timestamp=datetime.utcnow())
+    e.set_footer(text=f"{BOT_SIGNATURE}  •  Préfixe : !")
+    return e
 
+def _build_help_main_embed(ctx) -> discord.Embed:
     e = discord.Embed(
         title="◈  Ombre — Aide",
-        description="```\nBot dark & élégant\n```\nUtilise `!help <catégorie>` pour les détails.",
+        description=(
+            "```\nBot dark & élégant — Préfixe : !\n```\n"
+            "Clique sur un bouton **ou** tape `!help <catégorie>` pour les détails.\n\u200b"
+        ),
         color=C_VIOLET, timestamp=datetime.utcnow()
     )
     e.set_thumbnail(url=bot.user.display_avatar.url)
-    e.add_field(name="⚔  Modération",  value="`!help mod`",    inline=True)
-    e.add_field(name="✦  Économie",    value="`!help eco`",    inline=True)
-    e.add_field(name="◇  Fun",         value="`!help fun`",    inline=True)
-    e.add_field(name="⚙  Config",      value="`!help config`", inline=True)
-    e.add_field(name="◈  Rappels",     value="`!help remind`", inline=True)
-    e.add_field(name="🎨  Embeds",     value="`!help embeds`", inline=True)
-    e.add_field(name="🔗  Préfixe",    value="`!`",            inline=True)
+    for key, data in HELP_CATS.items():
+        e.add_field(name=f"{data['emoji']}  {data['title'].split('  ',1)[-1]}",
+                    value=f"`!help {key}`", inline=True)
     e.set_footer(text=BOT_SIGNATURE,
                  icon_url=ctx.guild.icon.url if ctx.guild and ctx.guild.icon else None)
-    await ctx.send(embed=e)
+    return e
+
+class HelpView(discord.ui.View):
+    def __init__(self, ctx):
+        super().__init__(timeout=90)
+        self.ctx = ctx
+        for key, data in HELP_CATS.items():
+            btn = discord.ui.Button(
+                label=data["title"].split("  ", 1)[-1],
+                emoji=data["emoji"] if len(data["emoji"]) == 1 else None,
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"help_{key}"
+            )
+            btn.callback = self._make_callback(key)
+            self.add_item(btn)
+
+    def _make_callback(self, key: str):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.ctx.author.id:
+                return await interaction.response.send_message(
+                    "Ce menu ne t'appartient pas.", ephemeral=True)
+            await interaction.response.edit_message(
+                embed=_build_help_cat_embed(key), view=self)
+        return callback
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+# ══════════════════════════════════════════════════════
+#  AIDE — COMMANDE
+# ══════════════════════════════════════════════════════
+@bot.command(aliases=["aide", "commands"])
+async def help(ctx, category: str = None):
+    if category and category.lower() in HELP_CATS:
+        return await ctx.send(embed=_build_help_cat_embed(category.lower()))
+    view = HelpView(ctx)
+    await ctx.send(embed=_build_help_main_embed(ctx), view=view)
 
 # ══════════════════════════════════════════════════════
 #  MODÉRATION
@@ -519,6 +713,7 @@ async def kick(ctx, member: discord.Member, *, reason="Aucune raison"):
     e.add_field(name="◈ Raison",    value=f"```{reason}```",  inline=False)
     e.set_thumbnail(url=member.display_avatar.url)
     _foot(e, ctx.author); await ctx.send(embed=e)
+    await ctx.message.add_reaction("⚔")
     log = em_mod("Kick")
     log.add_field(name="Membre",    value=f"{member} `{member.id}`")
     log.add_field(name="Modérateur",value=str(ctx.author))
@@ -540,6 +735,7 @@ async def ban(ctx, member: discord.Member, *, reason="Aucune raison"):
     e.add_field(name="◈ Raison",    value=f"```{reason}```",  inline=False)
     e.set_thumbnail(url=member.display_avatar.url)
     _foot(e, ctx.author); await ctx.send(embed=e)
+    await ctx.message.add_reaction("🔨")
     log = em_err("Ban")
     log.add_field(name="Membre",    value=f"{member} `{member.id}`")
     log.add_field(name="Modérateur",value=str(ctx.author))
@@ -621,6 +817,10 @@ async def warn(ctx, member: discord.Member, *, reason="Comportement inapproprié
     e.add_field(name="◈ Raison",      value=f"```{reason}```",   inline=False)
     e.set_thumbnail(url=member.display_avatar.url)
     _foot(e, ctx.author); await ctx.send(embed=e)
+    await ctx.message.add_reaction("⚠️")
+    # Succès "Mauvais élève" au 3e warn
+    if count >= 3:
+        grant_achievement(str(member.id), "warned")
     log = em_warn(f"Warn #{count}")
     log.add_field(name="Membre",    value=f"{member} `{member.id}`")
     log.add_field(name="Modérateur",value=str(ctx.author))
@@ -887,7 +1087,9 @@ async def coinflip(ctx):
 
 
 @bot.command()
+@commands.guild_only()
 async def say(ctx, *, message: str):
+    if not is_mod(ctx.author): return await no_perm(ctx)
     try: await ctx.message.delete()
     except discord.Forbidden: pass
     await ctx.send(message)
@@ -916,7 +1118,7 @@ async def serverinfo(ctx):
     _foot(e, ctx.author); await ctx.send(embed=e)
 
 
-@bot.command(aliases=["ui", "profil"])
+@bot.command(aliases=["ui"])
 @commands.guild_only()
 async def userinfo(ctx, member: discord.Member = None):
     target = member or ctx.author
@@ -1241,6 +1443,357 @@ async def embed_raw(ctx, salon: discord.TextChannel = None, couleur: str = "viol
     except discord.Forbidden:
         await ctx.send(embed=em_err("Permission refusée",
             f"Je ne peux pas écrire dans {destination.mention}"))
+
+
+# ══════════════════════════════════════════════════════
+#  VOL — SYSTÈME
+# ══════════════════════════════════════════════════════
+@bot.command(aliases=["steal", "rob"])
+@commands.guild_only()
+@commands.cooldown(1, 3600, commands.BucketType.user)
+async def vol(ctx, cible: discord.Member = None):
+    if cible is None:
+        return await ctx.send(embed=em_err("Cible manquante", "Mentionne quelqu'un à voler."), delete_after=6)
+    if cible.id == ctx.author.id or cible.bot:
+        return await ctx.send(embed=em_err("Cible invalide", "Tu ne peux pas te voler toi-même ni un bot."), delete_after=6)
+
+    uid_voleur = str(ctx.author.id)
+    uid_cible  = str(cible.id)
+    bal_cible  = get_bal(uid_cible)
+    bal_voleur = get_bal(uid_voleur)
+
+    if bal_cible < 50:
+        return await ctx.send(embed=em_info("Trop pauvre",
+            f"{cible.mention} n'a que `{bal_cible}` pièces, ça ne vaut pas le risque."))
+
+    succes = random.random() < 0.40
+
+    if succes:
+        vol_pct   = random.uniform(0.10, 0.30)
+        vol_montant = max(1, int(bal_cible * vol_pct))
+        add_bal(uid_voleur, vol_montant)
+        add_bal(uid_cible, -vol_montant)
+        check_balance_achievements(uid_voleur)
+        grant_achievement(uid_voleur, "thief_ok")
+        e = discord.Embed(
+            title="🦹  Vol réussi !",
+            description=(
+                f"{ctx.author.mention} a subtilisé **{vol_montant:,} pièces** à {cible.mention} !\n\n"
+                f"> Ton nouveau solde : `{get_bal(uid_voleur):,}` pièces"
+            ),
+            color=C_GREEN, timestamp=datetime.utcnow()
+        )
+        e.set_footer(text=random.choice(FOOTERS_ECO) + f"  •  {BOT_SIGNATURE}")
+        await ctx.send(embed=e)
+        await ctx.message.add_reaction("🦹")
+    else:
+        amende_pct = random.uniform(0.10, 0.20)
+        amende     = max(1, int(bal_voleur * amende_pct))
+        add_bal(uid_voleur, -amende)
+        grant_achievement(uid_voleur, "thief_fail")
+        e = discord.Embed(
+            title="😅  Vol échoué !",
+            description=(
+                f"{ctx.author.mention} s'est fait **attraper** en essayant de voler {cible.mention} !\n"
+                f"Amende : **{amende:,} pièces** perdues.\n\n"
+                f"> Ton solde : `{get_bal(uid_voleur):,}` pièces"
+            ),
+            color=C_RED, timestamp=datetime.utcnow()
+        )
+        e.set_footer(text=random.choice(FOOTERS_ECO) + f"  •  {BOT_SIGNATURE}")
+        await ctx.send(embed=e)
+        await ctx.message.add_reaction("😅")
+
+
+# ══════════════════════════════════════════════════════
+#  SLOTS — MACHINE À SOUS
+# ══════════════════════════════════════════════════════
+SLOT_SYMBOLS = ["🍒", "🍋", "🍊", "⭐", "💎", "7️⃣"]
+SLOT_MULT    = {"🍒": 1.5, "🍋": 2.0, "🍊": 2.5, "⭐": 3.0, "💎": 5.0, "7️⃣": 10.0}
+
+@bot.command(aliases=["machine", "casino"])
+@commands.guild_only()
+@commands.cooldown(1, 15, commands.BucketType.user)
+async def slots(ctx, montant: int = 0):
+    if montant < 10:
+        return await ctx.send(embed=em_err("Mise invalide", "Mise minimum : `10 pièces`."), delete_after=6)
+    uid = str(ctx.author.id)
+    if get_bal(uid) < montant:
+        return await ctx.send(embed=em_err("Fonds insuffisants",
+            f"Tu n'as que `{get_bal(uid):,}` pièces."), delete_after=6)
+
+    add_bal(uid, -montant)
+    rouleaux = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
+    grant_achievement(uid, "gambler")
+
+    if rouleaux[0] == rouleaux[1] == rouleaux[2]:
+        gain = int(montant * SLOT_MULT[rouleaux[0]])
+        add_bal(uid, gain)
+        check_balance_achievements(uid)
+        resultat = f"JACKPOT ✨  +**{gain:,}** pièces !"
+        color    = C_GOLD
+        react    = "🎰"
+    elif rouleaux[0] == rouleaux[1] or rouleaux[1] == rouleaux[2] or rouleaux[0] == rouleaux[2]:
+        gain = int(montant * 1.2)
+        add_bal(uid, gain)
+        resultat = f"Paire !  +**{gain:,}** pièces"
+        color    = C_GREEN
+        react    = "✅"
+    else:
+        gain     = 0
+        resultat = f"Perdu.  -**{montant:,}** pièces"
+        color    = C_RED
+        react    = "💸"
+
+    e = discord.Embed(
+        title="🎰  Machine à sous",
+        description=(
+            f"```\n| {rouleaux[0]}  {rouleaux[1]}  {rouleaux[2]} |\n```\n"
+            f"{resultat}\n\n"
+            f"> Solde : `{get_bal(uid):,}` pièces"
+        ),
+        color=color, timestamp=datetime.utcnow()
+    )
+    e.set_footer(text=random.choice(FOOTERS_ECO) + f"  •  {BOT_SIGNATURE}")
+    msg = await ctx.send(embed=e)
+    await msg.add_reaction(react)
+
+
+# ══════════════════════════════════════════════════════
+#  BLACKJACK
+# ══════════════════════════════════════════════════════
+def _bj_deck():
+    vals = [2,3,4,5,6,7,8,9,10,10,10,10,11] * 4
+    random.shuffle(vals)
+    return vals
+
+def _bj_total(hand: list[int]) -> int:
+    total = sum(hand)
+    aces  = hand.count(11)
+    while total > 21 and aces:
+        total -= 10
+        aces  -= 1
+    return total
+
+class BlackjackView(discord.ui.View):
+    def __init__(self, ctx, deck, player, dealer, mise, uid):
+        super().__init__(timeout=60)
+        self.ctx = ctx; self.deck = deck
+        self.player = player; self.dealer = dealer
+        self.mise = mise; self.uid = uid
+
+    def _embed(self, titre, desc, color):
+        e = discord.Embed(title=titre, description=desc, color=color, timestamp=datetime.utcnow())
+        e.set_footer(text=random.choice(FOOTERS_FUN) + f"  •  {BOT_SIGNATURE}")
+        return e
+
+    def _status(self, reveal=False):
+        d_shown = f"`{self.dealer[0]}` + `?`" if not reveal else " + ".join(f"`{c}`" for c in self.dealer)
+        p_shown = " + ".join(f"`{c}`" for c in self.player)
+        d_tot   = _bj_total(self.dealer) if reveal else "?"
+        p_tot   = _bj_total(self.player)
+        return (f"**Croupier :** {d_shown} = **{d_tot}**\n"
+                f"**Toi :** {p_shown} = **{p_tot}**")
+
+    async def end_game(self, interaction):
+        ptot = _bj_total(self.player)
+        while _bj_total(self.dealer) < 17:
+            self.dealer.append(self.deck.pop())
+        dtot = _bj_total(self.dealer)
+
+        if ptot > 21:
+            result = "Tu as dépassé 21. Perdu !"; color = C_RED; gain = 0
+        elif dtot > 21 or ptot > dtot:
+            gain = self.mise * 2; add_bal(self.uid, gain)
+            result = f"Victoire ! +**{gain:,}** pièces"; color = C_GOLD
+            check_balance_achievements(self.uid)
+        elif ptot == dtot:
+            add_bal(self.uid, self.mise)
+            result = "Égalité. Mise remboursée."; color = C_BLUE; gain = self.mise
+        else:
+            result = f"Croupier gagne. -**{self.mise:,}** pièces"; color = C_RED; gain = 0
+
+        for child in self.children:
+            child.disabled = True
+        e = self._embed("🃏  Blackjack — Fin", self._status(reveal=True) + f"\n\n{result}", color)
+        react = "🏆" if color == C_GOLD else ("⚖️" if color == C_BLUE else "💸")
+        await interaction.response.edit_message(embed=e, view=self)
+        await interaction.message.add_reaction(react)
+
+    @discord.ui.button(label="Tirer", emoji="🃏", style=discord.ButtonStyle.primary)
+    async def tirer(self, interaction: discord.Interaction, button):
+        if interaction.user.id != self.ctx.author.id:
+            return await interaction.response.send_message("Ce n'est pas ta partie.", ephemeral=True)
+        self.player.append(self.deck.pop())
+        if _bj_total(self.player) > 21:
+            return await self.end_game(interaction)
+        e = self._embed("🃏  Blackjack", self._status(), C_DARK)
+        await interaction.response.edit_message(embed=e, view=self)
+
+    @discord.ui.button(label="Rester", emoji="🛑", style=discord.ButtonStyle.danger)
+    async def rester(self, interaction: discord.Interaction, button):
+        if interaction.user.id != self.ctx.author.id:
+            return await interaction.response.send_message("Ce n'est pas ta partie.", ephemeral=True)
+        await self.end_game(interaction)
+
+@bot.command(aliases=["bj"])
+@commands.guild_only()
+@commands.cooldown(1, 15, commands.BucketType.user)
+async def blackjack(ctx, montant: int = 0):
+    if montant < 10:
+        return await ctx.send(embed=em_err("Mise invalide", "Mise minimum : `10 pièces`."), delete_after=6)
+    uid = str(ctx.author.id)
+    if get_bal(uid) < montant:
+        return await ctx.send(embed=em_err("Fonds insuffisants",
+            f"Tu n'as que `{get_bal(uid):,}` pièces."), delete_after=6)
+
+    add_bal(uid, -montant)
+    grant_achievement(uid, "gambler")
+    deck   = _bj_deck()
+    player = [deck.pop(), deck.pop()]
+    dealer = [deck.pop(), deck.pop()]
+
+    view = BlackjackView(ctx, deck, player, dealer, montant, uid)
+
+    if _bj_total(player) == 21:
+        gain = int(montant * 2.5)
+        add_bal(uid, gain)
+        check_balance_achievements(uid)
+        e = discord.Embed(
+            title="🃏  Blackjack naturel !",
+            description=f"**21 dès le départ !** +**{gain:,}** pièces 🎉",
+            color=C_GOLD, timestamp=datetime.utcnow()
+        )
+        e.set_footer(text=random.choice(FOOTERS_FUN) + f"  •  {BOT_SIGNATURE}")
+        return await ctx.send(embed=e)
+
+    d_shown = f"`{dealer[0]}` + `?`"
+    p_shown = " + ".join(f"`{c}`" for c in player)
+    e = discord.Embed(
+        title="🃏  Blackjack",
+        description=(
+            f"**Croupier :** {d_shown}\n"
+            f"**Toi :** {p_shown} = **{_bj_total(player)}**\n\n"
+            f"Mise : `{montant:,}` pièces\n\u200b"
+        ),
+        color=C_DARK, timestamp=datetime.utcnow()
+    )
+    e.set_footer(text=random.choice(FOOTERS_FUN) + f"  •  {BOT_SIGNATURE}")
+    await ctx.send(embed=e, view=view)
+
+
+# ══════════════════════════════════════════════════════
+#  NIVEAUX — COMMANDES
+# ══════════════════════════════════════════════════════
+@bot.command(aliases=["level", "rank", "xp"])
+@commands.guild_only()
+async def niveau(ctx, membre: discord.Member = None):
+    target = membre or ctx.author
+    uid    = str(target.id)
+    info   = get_xp_info(uid)
+    lvl    = info["level"]
+    xp     = info["xp"]
+    needed = xp_for_next(lvl)
+    curr   = xp_for_level(lvl)
+    bar    = xp_bar(xp, lvl)
+    pct    = int(((xp - curr) / max(needed - curr, 1)) * 100)
+
+    e = em_lvl(
+        f"Niveau {lvl} — {target.display_name}",
+        f"```\n{bar}  {pct}%\n```\n"
+        f"> **XP :** `{xp:,}` / `{needed:,}`\n"
+        f"> **Prochain niveau :** encore `{needed - xp:,}` XP"
+    )
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.add_field(name="◈ Niveau actuel", value=f"`{lvl}`", inline=True)
+    e.add_field(name="◈ XP total",      value=f"`{xp:,}`", inline=True)
+    _foot(e, ctx.author)
+    await ctx.send(embed=e)
+
+
+@bot.command(aliases=["topxp", "classementxp"])
+@commands.guild_only()
+async def topxp(ctx):
+    uid_list = ctx.guild.members
+    scores   = []
+    for m in uid_list:
+        if m.bot: continue
+        info = get_xp_info(str(m.id))
+        if info["xp"] > 0:
+            scores.append((m.display_name, info["xp"], info["level"]))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top = scores[:10]
+    if not top:
+        return await ctx.send(embed=em_info("Classement XP", "Aucun joueur enregistré."))
+
+    medals = ["🥇", "🥈", "🥉"] + ["◈"] * 7
+    lines  = [
+        f"{medals[i]}  **{name}** — Niv. `{lvl}`  •  `{xp:,}` XP"
+        for i, (name, xp, lvl) in enumerate(top)
+    ]
+    e = em_lvl("Classement XP", "\n".join(lines))
+    _foot(e, ctx.author)
+    await ctx.send(embed=e)
+
+
+@bot.command(aliases=["profile", "card"])
+@commands.guild_only()
+async def profil(ctx, membre: discord.Member = None):
+    target = membre or ctx.author
+    uid    = str(target.id)
+    info   = get_xp_info(uid)
+    lvl    = info["level"]
+    xp     = info["xp"]
+    bal    = get_bal(uid)
+    inv    = cards.get(uid, [])
+    achiev = achievements_d.get(uid, [])
+    bar    = xp_bar(xp, lvl)
+    needed = xp_for_next(lvl)
+    pct    = int(((xp - xp_for_level(lvl)) / max(needed - xp_for_level(lvl), 1)) * 100)
+
+    badges = " ".join(ACHIEVEMENTS[k][1] for k in achiev if k in ACHIEVEMENTS) or "Aucun"
+
+    e = discord.Embed(
+        title=f"◈  Profil — {target.display_name}",
+        color=C_VIOLET, timestamp=datetime.utcnow()
+    )
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.add_field(
+        name="◈  Niveau & XP",
+        value=f"**Niveau {lvl}**\n`{bar}` {pct}%\n`{xp:,}` / `{needed:,}` XP",
+        inline=False
+    )
+    e.add_field(name="✦  Pièces",    value=f"`{bal:,}` pièces",        inline=True)
+    e.add_field(name="📚  Cartes",   value=f"`{len(inv)}` carte(s)",    inline=True)
+    e.add_field(name="🏆  Succès",   value=f"`{len(achiev)}`",          inline=True)
+    e.add_field(name="🎖  Badges",   value=badges,                      inline=False)
+    e.set_footer(text=f"{BOT_SIGNATURE}  •  {target.display_name}",
+                 icon_url=target.display_avatar.url)
+    await ctx.send(embed=e)
+
+
+@bot.command(aliases=["achievements", "badges", "trophees"])
+@commands.guild_only()
+async def succes(ctx, membre: discord.Member = None):
+    target = membre or ctx.author
+    uid    = str(target.id)
+    unlocked = achievements_d.get(uid, [])
+
+    lines = []
+    for key, (name, emoji, desc) in ACHIEVEMENTS.items():
+        if key in unlocked:
+            lines.append(f"{emoji}  **{name}** — {desc}")
+        else:
+            lines.append(f"🔒  ~~{name}~~ — {desc}")
+
+    e = discord.Embed(
+        title=f"🏆  Succès — {target.display_name}",
+        description="\n".join(lines),
+        color=C_GOLD, timestamp=datetime.utcnow()
+    )
+    e.set_thumbnail(url=target.display_avatar.url)
+    e.set_footer(text=f"{len(unlocked)}/{len(ACHIEVEMENTS)} débloqués  •  {BOT_SIGNATURE}")
+    await ctx.send(embed=e)
 
 
 # ══════════════════════════════════════════════════════
