@@ -663,12 +663,11 @@ class HelpView(discord.ui.View):
     def __init__(self, ctx):
         super().__init__(timeout=90)
         self.ctx = ctx
+        self.msg  = None
         for key, data in HELP_CATS.items():
             btn = discord.ui.Button(
                 label=data["title"].split("  ", 1)[-1],
-                emoji=data["emoji"] if len(data["emoji"]) == 1 else None,
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"help_{key}"
+                style=discord.ButtonStyle.secondary
             )
             btn.callback = self._make_callback(key)
             self.add_item(btn)
@@ -685,6 +684,11 @@ class HelpView(discord.ui.View):
     async def on_timeout(self):
         for child in self.children:
             child.disabled = True
+        if self.msg:
+            try:
+                await self.msg.edit(view=self)
+            except Exception:
+                pass
 
 # ══════════════════════════════════════════════════════
 #  AIDE — COMMANDE
@@ -694,7 +698,8 @@ async def help(ctx, category: str = None):
     if category and category.lower() in HELP_CATS:
         return await ctx.send(embed=_build_help_cat_embed(category.lower()))
     view = HelpView(ctx)
-    await ctx.send(embed=_build_help_main_embed(ctx), view=view)
+    msg  = await ctx.send(embed=_build_help_main_embed(ctx), view=view)
+    view.msg = msg
 
 # ══════════════════════════════════════════════════════
 #  MODÉRATION
