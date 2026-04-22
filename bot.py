@@ -266,7 +266,12 @@ def get_gconf(gid: str) -> dict:
         "log_channel":      None,
         "level_roles":      {},     # "5": role_id
         "self_roles":       [],     # role_ids attribuables via !role
+        "treasure_channel": None,   # salon dédié aux trésors (None = auto)
+        "treasure_next":    0,      # timestamp du prochain spawn
     })
+    # rétro-compat
+    guild_config[gid].setdefault("treasure_channel", None)
+    guild_config[gid].setdefault("treasure_next", 0)
     return guild_config[gid]
 
 def get_gperms(gid: str) -> dict:
@@ -789,24 +794,45 @@ async def reminder_task():
 async def before_reminder():
     await bot.wait_until_ready()
 
-@tasks.loop(minutes=45)
+TREASURE_MIN_DELAY = 2 * 3600   # 2h minimum entre 2 spawns
+TREASURE_MAX_DELAY = 8 * 3600   # 8h maximum
+
+def _schedule_next_treasure(gconf: dict):
+    """Planifie le prochain spawn dans 2h à 8h."""
+    delay = random.randint(TREASURE_MIN_DELAY, TREASURE_MAX_DELAY)
+    gconf["treasure_next"] = datetime.utcnow().timestamp() + delay
+    save("guild_config", guild_config)
+
+@tasks.loop(minutes=2)
 async def random_event_task():
-    """Spawne un trésor aléatoire dans un salon configuré ou le 'général' du serveur."""
-    if random.random() > 0.5:
-        return
+    """Spawne un trésor à intervalle aléatoire (2h-8h) par serveur, dans le salon configuré."""
+    now = datetime.utcnow().timestamp()
     for guild in bot.guilds:
         gid = str(guild.id)
+        gconf = get_gconf(gid)
+        # Initialisation : planifie un premier spawn si jamais configuré
+        if not gconf.get("treasure_next"):
+            _schedule_next_treasure(gconf)
+            continue
+        if now < gconf["treasure_next"]:
+            continue
         if treasure_state.get(gid, {}).get("active"):
             continue
-        # Cherche un salon évident
-        ch = (discord.utils.get(guild.text_channels, name="général")
-              or discord.utils.get(guild.text_channels, name="general")
-              or discord.utils.get(guild.text_channels, name="chat")
-              or (guild.text_channels[0] if guild.text_channels else None))
+        # Choix du salon : configuré OU auto-détection
+        ch = None
+        if gconf.get("treasure_channel"):
+            ch = guild.get_channel(int(gconf["treasure_channel"]))
+        if ch is None:
+            ch = (discord.utils.get(guild.text_channels, name="général")
+                  or discord.utils.get(guild.text_channels, name="general")
+                  or discord.utils.get(guild.text_channels, name="chat")
+                  or (guild.text_channels[0] if guild.text_channels else None))
         if not ch:
+            _schedule_next_treasure(gconf)
             continue
         amount = random.randint(150, 800)
         treasure_state[gid] = {"active": True, "amount": amount, "channel": ch.id}
+        _schedule_next_treasure(gconf)  # planifie le suivant immédiatement
         try:
             e = em_gold("Un trésor est apparu !",
                 f"💰 Un trésor de **{amount:,} pièces** est caché dans ce salon !\n"
@@ -1196,6 +1222,47 @@ async def set_level_chan(ctx, channel: discord.TextChannel = None):
     save("guild_config", guild_config)
     e = em_ok("Salon level-up configuré", f"Les level-up iront dans {channel.mention}")
     _foot(e, ctx.author); await ctx.send(embed=e)
+
+@bot.command(name="settreasure", aliases=["settreasurechan", "settresorchan"])
+@commands.guild_only()
+async def set_treasure_chan(ctx, channel: discord.TextChannel = None):
+    """Configure le salon où apparaîtront les trésors aléatoires (auto si vide)."""
+    if not is_owner(ctx.author) and not has_perm(ctx.author, "admin"):
+        return await no_perm(ctx, "admin")
+    g = get_gconf(str(ctx.guild.id))
+    if channel is None:
+        g["treasure_channel"] = None
+        save("guild_config", guild_config)
+        return await ctx.send(embed=em_ok("Salon trésors — auto",
+            "Les trésors apparaîtront dans le salon principal détecté."))
+    g["treasure_channel"] = channel.id
+    save("guild_config", guild_config)
+    # Re-planifie pour bénéficier tout de suite du changement
+    _schedule_next_treasure(g)
+    nxt = int(g["treasure_next"])
+    e = em_ok("Salon trésors configuré",
+        f"💰 Les trésors apparaîtront désormais dans {channel.mention}.\n"
+        f"> Intervalle aléatoire : **2h à 8h**\n"
+        f"> Prochain spawn estimé : <t:{nxt}:R>")
+    e.set_thumbnail(url=ASSETS["treasure"])
+    _foot(e, ctx.author); await ctx.send(embed=e)
+
+@bot.command(name="treasureinfo", aliases=["tresorinfo"])
+@commands.guild_only()
+async def treasure_info(ctx):
+    """Affiche le salon configuré et l'estimation du prochain trésor."""
+    g = get_gconf(str(ctx.guild.id))
+    ch_id = g.get("treasure_channel")
+    ch = ctx.guild.get_channel(int(ch_id)) if ch_id else None
+    nxt = int(g.get("treasure_next") or 0)
+    desc = (
+        f"> **Salon :** {ch.mention if ch else '*(auto)*'}\n"
+        f"> **Intervalle :** entre **2h** et **8h** (aléatoire)\n"
+        f"> **Prochain spawn :** {('<t:'+str(nxt)+':R>') if nxt else '*à planifier*'}"
+    )
+    e = em_info("💰 Trésors aléatoires", desc)
+    e.set_thumbnail(url=ASSETS["treasure"])
+    await ctx.send(embed=e)
 
 @bot.command(name="setlogchan")
 @commands.guild_only()
