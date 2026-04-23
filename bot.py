@@ -2465,7 +2465,7 @@ async def avatar(ctx, member: discord.Member = None):
 
 EMOJI_PATTERN = re.compile(r"<(a?):([A-Za-z0-9_]+):(\d+)>")
 
-@bot.command(name="emojis", aliases=["steal", "voleremoji", "stealemoji"])
+@bot.command(name="emojis", aliases=["voleremoji", "stealemoji"])
 @commands.guild_only()
 async def emojis(ctx, *, args: str = ""):
     """Vole un ou plusieurs emojis personnalisés et les ajoute à ce serveur.
