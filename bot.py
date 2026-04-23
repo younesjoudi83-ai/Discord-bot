@@ -236,6 +236,15 @@ buffs          = _load("buffs",          {})
 clans          = _load("clans",          {})
 # Quêtes : quests[uid] = {"date": "YYYY-MM-DD", "active": [{"id":..,"type":..,"target":..,"progress":..,"reward":..,"desc":..,"done":False}]}
 quests         = _load("quests",         {})
+# Banque protégée du vol : bank[uid] = int
+bank_data      = _load("bank",           {})
+# Mariage : marriages[uid] = {"spouse": uid_spouse, "since": "YYYY-MM-DD"}
+marriages      = _load("marriages",      {})
+# Demandes de mariage en attente : marriage_requests[target_uid] = proposer_uid (mémoire)
+# AFK : afk[uid] = {"reason": str, "since": ts, "guild": gid}
+afk_data       = _load("afk",            {})
+# Codes promo : promo_codes[code] = {"amount": int, "max_uses": int, "used_by": [uid,...]}
+promo_codes    = _load("promo_codes",    {})
 
 # ── Données en mémoire uniquement ───────────────────
 spam_tracker: dict  = {}
@@ -613,6 +622,37 @@ async def on_message(message: discord.Message):
     gid     = str(message.guild.id)
     content = message.content.lower()
 
+    # ── AFK : retire le statut quand l'utilisateur reparle ──
+    uid_msg = str(message.author.id)
+    if uid_msg in afk_data:
+        info = afk_data.pop(uid_msg)
+        save("afk", afk_data)
+        try:
+            since = int(info.get("since", 0))
+            await message.channel.send(
+                embed=em_ok("◇ De retour",
+                    f"{message.author.mention}, ton AFK est retiré (depuis <t:{since}:R>)."),
+                delete_after=8)
+        except discord.Forbidden:
+            pass
+
+    # ── AFK : prévient quand quelqu'un mentionne un AFK ──
+    if message.mentions:
+        notified = set()
+        for m in message.mentions:
+            mid = str(m.id)
+            if mid in afk_data and mid != uid_msg and mid not in notified:
+                notified.add(mid)
+                info = afk_data[mid]
+                since = int(info.get("since", 0))
+                reason = info.get("reason") or "Aucune raison"
+                try:
+                    e = em_info(f"💤 {m.display_name} est AFK",
+                        f"> **Raison :** {reason}\n> **Depuis :** <t:{since}:R>")
+                    await message.channel.send(embed=e, delete_after=15)
+                except discord.Forbidden:
+                    pass
+
     # Filtre mots
     for word in word_filter.get(gid, []):
         if word in content:
@@ -883,6 +923,8 @@ HELP_CATS = {
             ("!slowmode [secondes]",             "Slowmode"),
             ("!lock / !unlock",                  "Verrouille/déverrouille le salon"),
             ("!nuke",                            "Recrée le salon (nettoyage total)"),
+            ("!emojis <:nom:id> ...",            "Vol d'emojis customs (ou réponse à un msg)"),
+            ("!stickers [nom]",                  "Vol de stickers (en réponse à un message)"),
         ]
     },
     "eco": {
@@ -897,6 +939,12 @@ HELP_CATS = {
             ("!use <objet>",                    "Utiliser un objet d'inventaire"),
             ("!inv",                            "Voir ton inventaire d'objets"),
             ("!gift <@membre>",                 "Cadeau aléatoire à un ami (cd 12h)"),
+            ("!work",                           "Petit job honnête (cd 1h)"),
+            ("!crime",                          "Crime risqué (cd 2h, +/-)"),
+            ("!fish",                           "Pêche aléatoire (cd 5min)"),
+            ("!bank",                           "État de ta banque protégée"),
+            ("!bank deposit/withdraw <montant>","Déposer/retirer (à l'abri du vol)"),
+            ("!redeem <code>",                  "Utiliser un code promo"),
         ]
     },
     "casino": {
@@ -920,6 +968,10 @@ HELP_CATS = {
             ("!quiz",                           "Mini-quiz culture (gain pièces)"),
             ("!conseil",                        "Reçois un conseil aléatoire"),
             ("!ship <@a> <@b>",                 "Compatibilité amoureuse"),
+            ("!afk [raison]",                   "Te marquer AFK (notifie les pings)"),
+            ("!marry <@membre>",                "Demande en mariage / accepte"),
+            ("!divorce",                        "Mettre fin au mariage"),
+            ("!couple [membre]",                "Voir l'état marital"),
         ]
     },
     "clan": {
@@ -953,6 +1005,8 @@ HELP_CATS = {
             ("!avatar [membre]",                "Voir un avatar"),
             ("!serverinfo",                     "Infos serveur"),
             ("!userinfo [membre]",              "Infos membre"),
+            ("!banner [membre]",                "Voir une bannière de profil"),
+            ("!poll Q? | opt1 | opt2 | ...",    "Sondage à réactions (jusqu'à 10 options)"),
             ("!claim",                          "Attraper le trésor aléatoire"),
         ]
     },
@@ -965,6 +1019,15 @@ HELP_CATS = {
             ("!succes [membre]",                "Voir les succès débloqués"),
         ]
     },
+    "promo": {
+        "title": "🎟️  Codes promo", "color": C_GOLD, "emoji": "🎟️",
+        "cmds": [
+            ("!redeem <code>",                  "Utiliser un code promo"),
+            ("!createcode <code> <montant> [usages]", "Créer un code (admin)"),
+            ("!deletecode <code>",              "Supprimer un code (admin)"),
+            ("!codes",                          "Lister les codes existants (admin)"),
+        ]
+    },
     "config": {
         "title": "⚙  Configuration", "color": C_VIOLET, "emoji": "⚙",
         "cmds": [
@@ -972,6 +1035,8 @@ HELP_CATS = {
             ("!setlogchan #salon",              "Salon des logs de modération"),
             ("!setlevelrole <niv> <@rôle>",     "Rôle attribué à un niveau"),
             ("!setautorole <@rôle>",            "Rôle auto nouveaux membres"),
+            ("!settreasure [#salon]",           "Salon des trésors aléatoires (vide = auto)"),
+            ("!treasureinfo",                   "Salon + estimation du prochain trésor"),
             ("!addrr <msg_id> <emoji> <@rôle>", "Reaction role"),
             ("!removerr <msg_id> <emoji>",      "Retirer reaction role"),
             ("!rolemenu <titre>",               "Menu boutons pour self-roles"),
@@ -2398,6 +2463,147 @@ async def avatar(ctx, member: discord.Member = None):
     e.set_image(url=target.display_avatar.url)
     await ctx.send(embed=e)
 
+EMOJI_PATTERN = re.compile(r"<(a?):([A-Za-z0-9_]+):(\d+)>")
+
+@bot.command(name="emojis", aliases=["steal", "voleremoji", "stealemoji"])
+@commands.guild_only()
+async def emojis(ctx, *, args: str = ""):
+    """Vole un ou plusieurs emojis personnalisés et les ajoute à ce serveur.
+    Usage : `!emojis <:nom:id> <:autre:id> ...`  (ou réponds à un message contenant les emojis)
+    """
+    if not is_owner(ctx.author) and not has_perm(ctx.author, "admin"):
+        return await no_perm(ctx, "admin")
+    if not ctx.guild.me.guild_permissions.manage_emojis_and_stickers:
+        return await ctx.send(embed=em_err("Permission bot manquante",
+            "J'ai besoin de la permission **Gérer les emojis et stickers**."))
+
+    # Source : message en réponse OU args
+    source_text = args
+    if ctx.message.reference and not source_text:
+        try:
+            ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+            source_text = ref.content
+        except Exception:
+            pass
+
+    matches = EMOJI_PATTERN.findall(source_text or "")
+    if not matches:
+        return await ctx.send(embed=em_err("Aucun emoji trouvé",
+            "Donne au moins un emoji custom : `!emojis <:nom:id>` ou réponds à un message qui en contient."))
+
+    # Dédoublonnage par ID, max 10 par appel
+    seen = set(); items = []
+    for animated, name, eid in matches:
+        if eid in seen: continue
+        seen.add(eid)
+        items.append((bool(animated), name, eid))
+        if len(items) >= 10: break
+
+    progress = em_info("🪄 Vol d'emojis en cours…",
+        f"Tentative d'import de **{len(items)}** emoji(s)…")
+    msg = await ctx.send(embed=progress)
+
+    import aiohttp
+    added, failed = [], []
+    async with aiohttp.ClientSession() as session:
+        for animated, name, eid in items:
+            ext = "gif" if animated else "png"
+            url = f"https://cdn.discordapp.com/emojis/{eid}.{ext}?size=128&quality=lossless"
+            try:
+                async with session.get(url) as r:
+                    if r.status != 200:
+                        failed.append(f"`{name}` (HTTP {r.status})"); continue
+                    data = await r.read()
+                new_emoji = await ctx.guild.create_custom_emoji(
+                    name=name[:32] or "vole",
+                    image=data,
+                    reason=f"Vol d'emoji par {ctx.author}"
+                )
+                added.append(str(new_emoji))
+            except discord.HTTPException as exc:
+                failed.append(f"`{name}` ({exc.text or exc.status})")
+            except Exception as exc:
+                failed.append(f"`{name}` ({type(exc).__name__})")
+
+    color = C_GOLD if added and not failed else (C_GREEN if added else C_RED)
+    e = _em("🪄 Vol d'emojis", None, color)
+    if added:
+        e.add_field(name=f"✦ Ajoutés ({len(added)})",
+                    value=" ".join(added), inline=False)
+    if failed:
+        e.add_field(name=f"✗ Échecs ({len(failed)})",
+                    value="\n".join(failed), inline=False)
+    e.set_thumbnail(url="https://upload.wikimedia.org/wikipedia/commons/thumb/8/8e/Mask_thief.png/240px-Mask_thief.png")
+    await msg.edit(embed=e)
+
+@bot.command(name="stickers", aliases=["stealsticker", "volersticker"])
+@commands.guild_only()
+async def stickers(ctx, *, name_override: str = None):
+    """Vole les stickers d'un message en réponse et les ajoute à ce serveur.
+    Usage : réponds à un message contenant un/des sticker(s) avec `!stickers [nom]`
+    """
+    if not is_owner(ctx.author) and not has_perm(ctx.author, "admin"):
+        return await no_perm(ctx, "admin")
+    if not ctx.guild.me.guild_permissions.manage_emojis_and_stickers:
+        return await ctx.send(embed=em_err("Permission bot manquante",
+            "J'ai besoin de la permission **Gérer les emojis et stickers**."))
+    if not ctx.message.reference:
+        return await ctx.send(embed=em_err("Aucune source",
+            "Réponds à un message contenant un ou plusieurs stickers avec `!stickers`."))
+    try:
+        ref = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+    except Exception:
+        return await ctx.send(embed=em_err("Message introuvable"))
+    if not ref.stickers:
+        return await ctx.send(embed=em_err("Aucun sticker",
+            "Le message ciblé ne contient pas de sticker."))
+
+    items = ref.stickers[:5]
+    progress = em_info("🪄 Vol de stickers en cours…",
+        f"Tentative d'import de **{len(items)}** sticker(s)…")
+    msg = await ctx.send(embed=progress)
+
+    import aiohttp
+    added, failed = [], []
+    async with aiohttp.ClientSession() as session:
+        for st in items:
+            sticker_name = (name_override or st.name)[:30] or "vole"
+            try:
+                async with session.get(str(st.url)) as r:
+                    if r.status != 200:
+                        failed.append(f"`{st.name}` (HTTP {r.status})"); continue
+                    data = await r.read()
+                    ctype = r.headers.get("Content-Type", "")
+                ext = "png"
+                if "json" in ctype or str(st.url).endswith(".json"):
+                    failed.append(f"`{st.name}` (Lottie non supporté)"); continue
+                if "gif" in ctype: ext = "gif"
+                elif "apng" in ctype: ext = "png"
+                file = discord.File(fp=__import__("io").BytesIO(data), filename=f"{sticker_name}.{ext}")
+                new_st = await ctx.guild.create_sticker(
+                    name=sticker_name,
+                    description=f"Volé par {ctx.author}",
+                    emoji="⭐",
+                    file=file,
+                    reason=f"Vol de sticker par {ctx.author}"
+                )
+                added.append(f"`{new_st.name}`")
+            except discord.HTTPException as exc:
+                failed.append(f"`{st.name}` ({exc.text or exc.status})")
+            except Exception as exc:
+                failed.append(f"`{st.name}` ({type(exc).__name__})")
+
+    color = C_GOLD if added and not failed else (C_GREEN if added else C_RED)
+    e = _em("🪄 Vol de stickers", None, color)
+    if added:
+        e.add_field(name=f"✦ Ajoutés ({len(added)})",
+                    value=" ".join(added), inline=False)
+    if failed:
+        e.add_field(name=f"✗ Échecs ({len(failed)})",
+                    value="\n".join(failed), inline=False)
+    e.set_thumbnail(url="https://upload.wikimedia.org/wikipedia/commons/thumb/8/8e/Mask_thief.png/240px-Mask_thief.png")
+    await msg.edit(embed=e)
+
 @bot.command()
 @commands.guild_only()
 async def serverinfo(ctx):
@@ -2785,6 +2991,337 @@ async def succes(ctx, membre: discord.Member = None):
         description="\n".join(lines), color=C_GOLD, timestamp=datetime.utcnow())
     e.set_thumbnail(url=target.display_avatar.url)
     e.set_footer(text=f"{len(unlocked)}/{len(ACHIEVEMENTS)} débloqués  •  {BOT_SIGNATURE}")
+    await ctx.send(embed=e)
+
+# ══════════════════════════════════════════════════════
+#  EXTRAS — BANNER, POLL, AFK, WORK/CRIME/FISH, BANK,
+#  MARIAGE, CODES PROMO
+# ══════════════════════════════════════════════════════
+
+# ── Banner d'utilisateur ──────────────────────────────
+@bot.command()
+async def banner(ctx, member: discord.Member = None):
+    """Affiche la bannière de profil d'un membre."""
+    target = member or ctx.author
+    try:
+        user = await bot.fetch_user(target.id)
+    except discord.HTTPException:
+        return await ctx.send(embed=em_err("Utilisateur introuvable"))
+    if not user.banner:
+        return await ctx.send(embed=em_info("Aucune bannière",
+            f"{target.display_name} n'a pas de bannière de profil."))
+    e = _em(f"Bannière — {target.display_name}", color=C_VIOLET)
+    e.set_image(url=user.banner.url)
+    await ctx.send(embed=e)
+
+# ── Sondage ───────────────────────────────────────────
+POLL_EMOJIS = ["🇦","🇧","🇨","🇩","🇪","🇫","🇬","🇭","🇮","🇯"]
+
+@bot.command()
+@commands.guild_only()
+async def poll(ctx, *, args: str):
+    """Sondage : `!poll Question ? | option1 | option2 | ...` (jusqu'à 10 options)."""
+    parts = [p.strip() for p in args.split("|") if p.strip()]
+    if len(parts) < 3:
+        return await ctx.send(embed=em_err("Format invalide",
+            "Utilisation : `!poll Question ? | option1 | option2 | ...` (min 2 options)."))
+    question, options = parts[0], parts[1:11]
+    desc = "\n".join(f"{POLL_EMOJIS[i]}  {opt}" for i, opt in enumerate(options))
+    e = _em(f"📊 {question}", desc, C_VIOLET)
+    e.set_footer(text=f"Sondage par {ctx.author.display_name}  •  {BOT_SIGNATURE}")
+    msg = await ctx.send(embed=e)
+    for i in range(len(options)):
+        try: await msg.add_reaction(POLL_EMOJIS[i])
+        except discord.HTTPException: pass
+
+# ── AFK ───────────────────────────────────────────────
+@bot.command()
+@commands.guild_only()
+async def afk(ctx, *, raison: str = "Pas de raison"):
+    uid = str(ctx.author.id)
+    afk_data[uid] = {
+        "reason": raison[:200],
+        "since":  int(datetime.utcnow().timestamp()),
+        "guild":  str(ctx.guild.id),
+    }
+    save("afk", afk_data)
+    e = em_info(f"💤 {ctx.author.display_name} est AFK",
+        f"> **Raison :** {raison[:200]}\n> Tape n'importe quel message pour revenir.")
+    await ctx.send(embed=e)
+
+# ── Travail (job honnête) ─────────────────────────────
+WORK_LINES = [
+    "Tu as livré des pizzas en scooter 🛵",
+    "Tu as codé une fonctionnalité critique 💻",
+    "Tu as servi des cafés tout l'après-midi ☕",
+    "Tu as réparé une vieille horloge ⏰",
+    "Tu as donné un cours de musique 🎵",
+    "Tu as gardé des animaux 🐶",
+    "Tu as repeint un appartement 🎨",
+    "Tu as fait une mission de freelance 📑",
+]
+
+@bot.command()
+@commands.guild_only()
+@commands.cooldown(1, 3600, commands.BucketType.user)
+async def work(ctx):
+    uid = str(ctx.author.id)
+    gain = random.randint(120, 420)
+    if get_buff(uid, "casinox2"): gain *= 2
+    add_bal(uid, gain); check_balance_achievements(uid)
+    progress_quest(uid, "wins")
+    e = em_gold("💼 Travail terminé",
+        f"{random.choice(WORK_LINES)}\n+**{gain:,}** pièces\n> Solde : `{get_bal(uid):,}`")
+    await ctx.send(embed=e)
+
+# ── Crime risqué ──────────────────────────────────────
+CRIME_OK = [
+    "Tu as cambriolé une bijouterie en silence 💎",
+    "Tu as piraté un distributeur 🏧",
+    "Tu as revendu des pièces volées au marché noir 🕶️",
+    "Tu as fait gagner un cheval truqué 🐎",
+]
+CRIME_BAD = [
+    "La police t'a coffré en pleine action 🚓",
+    "Ton complice t'a balancé… 🐀",
+    "Une caméra cachée a tout filmé 📹",
+    "Tu t'es trompé d'adresse, c'était chez un flic 👮",
+]
+
+@bot.command()
+@commands.guild_only()
+@commands.cooldown(1, 7200, commands.BucketType.user)
+async def crime(ctx):
+    uid = str(ctx.author.id)
+    if random.random() < 0.55:
+        gain = random.randint(300, 900)
+        if get_buff(uid, "casinox2"): gain *= 2
+        add_bal(uid, gain); check_balance_achievements(uid)
+        e = em_gold("🦹 Crime réussi",
+            f"{random.choice(CRIME_OK)}\n+**{gain:,}** pièces\n> Solde : `{get_bal(uid):,}`")
+    else:
+        amende = random.randint(150, 600)
+        add_bal(uid, -amende)
+        e = _em("🚔 Crime raté",
+            f"{random.choice(CRIME_BAD)}\n-**{amende:,}** pièces d'amende\n> Solde : `{get_bal(uid):,}`",
+            C_RED)
+    await ctx.send(embed=e)
+
+# ── Pêche ─────────────────────────────────────────────
+FISH_TABLE = [
+    ("🐟  une sardine",        20,  60),
+    ("🐠  un poisson tropical", 60, 150),
+    ("🐡  un poisson-globe",   100, 220),
+    ("🦑  un calamar géant",   180, 400),
+    ("🦈  un requin",          400, 800),
+    ("🐉  un dragon des mers (LÉGENDAIRE)", 1500, 3000),
+    ("🥾  une vieille botte",   0,   0),
+    ("🗑️  un sac plastique",    0,   0),
+]
+FISH_WEIGHTS = [30, 22, 16, 12, 6, 1, 7, 6]
+
+@bot.command(aliases=["peche"])
+@commands.guild_only()
+@commands.cooldown(1, 300, commands.BucketType.user)
+async def fish(ctx):
+    uid = str(ctx.author.id)
+    label, lo, hi = random.choices(FISH_TABLE, weights=FISH_WEIGHTS, k=1)[0]
+    if hi == 0:
+        e = em_info("🎣 Tu as pêché…", f"{label}\nDommage, rien à vendre.")
+    else:
+        gain = random.randint(lo, hi)
+        if get_buff(uid, "casinox2"): gain *= 2
+        add_bal(uid, gain); check_balance_achievements(uid)
+        progress_quest(uid, "wins")
+        e = em_gold("🎣 Belle prise !",
+            f"Tu as pêché {label} et tu l'as revendu(e) **{gain:,}** pièces !\n"
+            f"> Solde : `{get_bal(uid):,}`")
+    await ctx.send(embed=e)
+
+# ── Banque (protégée du vol) ──────────────────────────
+def get_bank(uid: str) -> int:
+    return int(bank_data.get(uid, 0))
+
+def add_bank(uid: str, amt: int):
+    bank_data[uid] = max(0, get_bank(uid) + amt)
+    save("bank", bank_data)
+
+@bot.group(invoke_without_command=True)
+@commands.guild_only()
+async def bank(ctx):
+    uid = str(ctx.author.id)
+    e = em_gold(f"🏦 Banque — {ctx.author.display_name}",
+        f"> **Solde banque :** `{get_bank(uid):,}` pièces *(à l'abri des vols)*\n"
+        f"> **Solde poche :** `{get_bal(uid):,}` pièces\n\n"
+        f"Utilise `!bank deposit <montant>` ou `!bank withdraw <montant>`.")
+    e.set_thumbnail(url=ASSETS.get("daily"))
+    await ctx.send(embed=e)
+
+@bank.command(name="deposit", aliases=["dep"])
+async def bank_deposit(ctx, montant):
+    uid = str(ctx.author.id)
+    bal = get_bal(uid)
+    if isinstance(montant, str) and montant.lower() in ("all", "max", "tout"):
+        amt = bal
+    else:
+        try: amt = int(montant)
+        except (ValueError, TypeError):
+            return await ctx.send(embed=em_err("Montant invalide"))
+    if amt <= 0:    return await ctx.send(embed=em_err("Montant invalide"))
+    if amt > bal:   return await ctx.send(embed=em_err("Fonds insuffisants"))
+    add_bal(uid, -amt); add_bank(uid, amt)
+    await ctx.send(embed=em_ok("Dépôt effectué",
+        f"+**{amt:,}** dans la banque.\n> Banque : `{get_bank(uid):,}`  •  Poche : `{get_bal(uid):,}`"))
+
+@bank.command(name="withdraw", aliases=["wd", "retirer"])
+async def bank_withdraw(ctx, montant):
+    uid = str(ctx.author.id)
+    b = get_bank(uid)
+    if isinstance(montant, str) and montant.lower() in ("all", "max", "tout"):
+        amt = b
+    else:
+        try: amt = int(montant)
+        except (ValueError, TypeError):
+            return await ctx.send(embed=em_err("Montant invalide"))
+    if amt <= 0:   return await ctx.send(embed=em_err("Montant invalide"))
+    if amt > b:    return await ctx.send(embed=em_err("Fonds insuffisants"))
+    add_bank(uid, -amt); add_bal(uid, amt)
+    await ctx.send(embed=em_ok("Retrait effectué",
+        f"-**{amt:,}** de la banque.\n> Banque : `{get_bank(uid):,}`  •  Poche : `{get_bal(uid):,}`"))
+
+@bank.command(name="balance", aliases=["bal"])
+async def bank_balance(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    uid = str(target.id)
+    e = em_gold(f"🏦 Banque — {target.display_name}",
+        f"> Banque : `{get_bank(uid):,}`\n> Poche : `{get_bal(uid):,}`")
+    await ctx.send(embed=e)
+
+# ── Mariage / divorce ─────────────────────────────────
+marriage_requests: dict = {}  # target_uid -> proposer_uid (mémoire)
+
+@bot.command()
+@commands.guild_only()
+async def marry(ctx, member: discord.Member):
+    if member.bot or member.id == ctx.author.id:
+        return await ctx.send(embed=em_err("Cible invalide"))
+    uid_a, uid_b = str(ctx.author.id), str(member.id)
+    if uid_a in marriages:
+        return await ctx.send(embed=em_err("Déjà marié(e)",
+            f"Tu es déjà marié(e). Utilise `!divorce` d'abord."))
+    if uid_b in marriages:
+        return await ctx.send(embed=em_err("Cible déjà mariée"))
+    if marriage_requests.get(uid_b) == uid_a:
+        return await ctx.send(embed=em_warn("Demande déjà envoyée",
+            f"{member.mention} doit faire `!marry {ctx.author.mention}` pour accepter."))
+    if marriage_requests.get(uid_a) == uid_b:
+        # Réciprocité : on marie
+        marriage_requests.pop(uid_a, None)
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        marriages[uid_a] = {"spouse": uid_b, "since": date_str}
+        marriages[uid_b] = {"spouse": uid_a, "since": date_str}
+        save("marriages", marriages)
+        e = em_gold("💍 Mariage célébré !",
+            f"{ctx.author.mention} et {member.mention} sont maintenant unis 💞")
+        e.set_thumbnail(url=ASSETS.get("ship"))
+        return await ctx.send(embed=e)
+    marriage_requests[uid_b] = uid_a
+    e = em_info("💌 Demande en mariage",
+        f"{member.mention}, {ctx.author.mention} te propose de l'épouser !\n"
+        f"Réponds par `!marry {ctx.author.mention}` pour accepter.")
+    e.set_thumbnail(url=ASSETS.get("ship"))
+    await ctx.send(embed=e)
+
+@bot.command()
+@commands.guild_only()
+async def divorce(ctx):
+    uid = str(ctx.author.id)
+    if uid not in marriages:
+        return await ctx.send(embed=em_err("Tu n'es pas marié(e)"))
+    spouse = marriages.pop(uid).get("spouse")
+    if spouse and spouse in marriages:
+        marriages.pop(spouse, None)
+    save("marriages", marriages)
+    spouse_obj = ctx.guild.get_member(int(spouse)) if spouse else None
+    mention = spouse_obj.mention if spouse_obj else f"`{spouse}`"
+    await ctx.send(embed=em_warn("💔 Divorce",
+        f"{ctx.author.mention} et {mention} ne sont plus mariés."))
+
+@bot.command(aliases=["mariage"])
+@commands.guild_only()
+async def couple(ctx, member: discord.Member = None):
+    target = member or ctx.author
+    uid = str(target.id)
+    info = marriages.get(uid)
+    if not info:
+        return await ctx.send(embed=em_info("Célibataire",
+            f"{target.display_name} n'est pas marié(e)."))
+    spouse = ctx.guild.get_member(int(info["spouse"]))
+    mention = spouse.mention if spouse else f"`{info['spouse']}`"
+    e = _em(f"💞 Couple — {target.display_name}",
+        f"> **Marié(e) à :** {mention}\n> **Depuis :** `{info.get('since','?')}`",
+        C_VIOLET)
+    e.set_thumbnail(url=ASSETS.get("ship"))
+    await ctx.send(embed=e)
+
+# ── Codes promo ───────────────────────────────────────
+@bot.command(name="createcode", aliases=["addcode"])
+@commands.guild_only()
+async def create_code(ctx, code: str, montant: int, max_uses: int = 1):
+    """Crée un code promo (réservé owner/admin)."""
+    if not is_owner(ctx.author) and not has_perm(ctx.author, "admin"):
+        return await no_perm(ctx, "admin")
+    if montant <= 0 or max_uses <= 0:
+        return await ctx.send(embed=em_err("Valeurs invalides"))
+    code_k = code.upper()
+    if code_k in promo_codes:
+        return await ctx.send(embed=em_err("Code déjà existant"))
+    promo_codes[code_k] = {"amount": montant, "max_uses": max_uses, "used_by": []}
+    save("promo_codes", promo_codes)
+    e = em_ok("Code promo créé",
+        f"`{code_k}` — **{montant:,}** pièces — utilisable **{max_uses}** fois\n"
+        f"Les utilisateurs peuvent faire `!redeem {code_k}`.")
+    await ctx.send(embed=e)
+
+@bot.command(name="deletecode", aliases=["removecode"])
+@commands.guild_only()
+async def delete_code(ctx, code: str):
+    if not is_owner(ctx.author) and not has_perm(ctx.author, "admin"):
+        return await no_perm(ctx, "admin")
+    code_k = code.upper()
+    if code_k not in promo_codes:
+        return await ctx.send(embed=em_err("Code inconnu"))
+    promo_codes.pop(code_k); save("promo_codes", promo_codes)
+    await ctx.send(embed=em_ok("Code supprimé", f"`{code_k}` supprimé."))
+
+@bot.command(name="codes")
+@commands.guild_only()
+async def list_codes(ctx):
+    if not is_owner(ctx.author) and not has_perm(ctx.author, "admin"):
+        return await no_perm(ctx, "admin")
+    if not promo_codes:
+        return await ctx.send(embed=em_info("Aucun code"))
+    lines = [f"`{k}` — **{d['amount']:,}** • {len(d['used_by'])}/{d['max_uses']} utilisé(s)"
+             for k, d in promo_codes.items()]
+    await ctx.send(embed=em_gold("Codes promo", "\n".join(lines)))
+
+@bot.command()
+@commands.guild_only()
+async def redeem(ctx, code: str):
+    code_k = code.upper()
+    data = promo_codes.get(code_k)
+    if not data:
+        return await ctx.send(embed=em_err("Code invalide"))
+    uid = str(ctx.author.id)
+    if uid in data["used_by"]:
+        return await ctx.send(embed=em_warn("Déjà utilisé",
+            "Tu as déjà réclamé ce code."))
+    if len(data["used_by"]) >= data["max_uses"]:
+        return await ctx.send(embed=em_err("Code épuisé"))
+    data["used_by"].append(uid); save("promo_codes", promo_codes)
+    add_bal(uid, data["amount"]); check_balance_achievements(uid)
+    e = em_gold("🎟️  Code utilisé",
+        f"+**{data['amount']:,}** pièces !\n> Solde : `{get_bal(uid):,}`")
     await ctx.send(embed=e)
 
 # ══════════════════════════════════════════════════════
